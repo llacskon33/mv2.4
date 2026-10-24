@@ -1,0 +1,216 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Clean Windows and Check Disk
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          function Show-DiskSpace {
+            Get-CimInstance Win32_LogicalDisk `
+              -Filter "DeviceID='C:'" |
+              ForEach-Object {
+                Write-Host ("Total: {0:N2} GB | Free: {1:N2} GB" -f `
+                  ($_.Size / 1GB), ($_.FreeSpace / 1GB))
+              }
+          }
+
+          Write-Host "=== DISK BEFORE CLEANUP ==="
+          Show-DiskSpace
+
+          # Clean temporary files
+          $paths = @($env:TEMP, "$env:WINDIR\Temp")
+
+          foreach ($path in $paths) {
+            if (Test-Path $path) {
+              Get-ChildItem -LiteralPath $path -Force `
+                -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force `
+                -ErrorAction SilentlyContinue
+            }
+          }
+
+          # Clean Windows component store
+          DISM.exe /Online /Cleanup-Image /StartComponentCleanup
+
+          Write-Host "=== DISK AFTER CLEANUP ==="
+          Show-DiskSpace
+
+      - name: Generate Password and Create RDP User
+        shell: pwsh
+        run: |
+          $upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'.ToCharArray()
+          $lower = 'abcdefghijkmnopqrstuvwxyz'.ToCharArray()
+          $digits = '23456789'.ToCharArray()
+          $special = '!@#$%&*_-+'.ToCharArray()
+          $all = $upper + $lower + $digits + $special
+
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+
+          function Get-SecureChar($set) {
+            $bytes = New-Object byte[] 4
+            $rng.GetBytes($bytes)
+            $n = [BitConverter]::ToUInt32($bytes, 0)
+            return $set[[int]($n % $set.Length)]
+          }
+
+          $chars = @(
+            (Get-SecureChar $upper)
+            (Get-SecureChar $lower)
+            (Get-SecureChar $digits)
+            (Get-SecureChar $special)
+          )
+
+          for ($i = 4; $i -lt 24; $i++) {
+            $chars += Get-SecureChar $all
+          }
+
+          # Shuffle the generated password
+          for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $j = Get-Random -Minimum 0 -Maximum ($i + 1)
+            $temp = $chars[$i]
+            $chars[$i] = $chars[$j]
+            $chars[$j] = $temp
+          }
+
+          $password = -join $chars
+          $rng.Dispose()
+
+          $securePassword = ConvertTo-SecureString `
+            $password -AsPlainText -Force
+
+          if (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name RDP -Password $securePassword
+          } else {
+            New-LocalUser -Name RDP `
+              -Password $securePassword `
+              -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member RDP `
+            -ErrorAction SilentlyContinue
+
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+          Write-Host "RDP user created and password generated."
+
+      - name: Configure RDP
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop"
+
+          Start-Service -Name TermService
+
+          Write-Host "RDP configured with NLA enabled."
+
+      - name: Install Tailscale
+        shell: pwsh
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          $process = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$installer`" /quiet /norestart" `
+            -Wait -PassThru
+
+          Remove-Item $installer -Force `
+            -ErrorAction SilentlyContinue
+
+          if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed."
+          }
+
+      - name: Connect Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTHKEY)) {
+            throw "Missing TAILSCALE_AUTH_KEY GitHub secret."
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          & $ts up "--authkey=$env:TS_AUTHKEY" `
+            "--hostname=gh-rdp-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          $ip = $null
+
+          for ($i = 0; $i -lt 12 -and -not $ip; $i++) {
+            Start-Sleep -Seconds 5
+            $ip = (& $ts ip -4 | Select-Object -First 1).Trim()
+          }
+
+          if (-not $ip) {
+            throw "No Tailscale IP assigned."
+          }
+
+          "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+          Write-Host "Tailscale connected."
+
+      - name: Verify RDP
+        shell: pwsh
+        run: |
+          $ready = $false
+
+          for ($i = 0; $i -lt 12; $i++) {
+            $result = Test-NetConnection `
+              -ComputerName $env:TAILSCALE_IP `
+              -Port 3389 `
+              -WarningAction SilentlyContinue
+
+            if ($result.TcpTestSucceeded) {
+              $ready = $true
+              break
+            }
+
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $ready) {
+            throw "RDP port 3389 is not reachable."
+          }
+
+          Write-Host "RDP connectivity verified."
+
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "=================="
+
+          while ($true) {
+            Write-Host "RDP active: $(Get-Date)"
+            Start-Sleep -Seconds 300
+          } 
